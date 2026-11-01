@@ -1,0 +1,79 @@
+name: Build unsigned Windows installer
+
+# Builds the same unsigned NSIS installer the local `package:desktop:win:x64:unsigned`
+# command produces (apps/desktop/packaging/README.md), on a stock GitHub-hosted
+# Windows runner instead of DeepSeek's internal packaging machine. Delivers the
+# installer as git objects on a dedicated branch so networks that cannot reach
+# Actions artifact downloads can still fetch it with plain git.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - .github/workflows/build-unsigned-win-installer.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-win-installer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v5.0.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Write local unsigned packaging environment
+        shell: bash
+        run: |
+          cat > apps/desktop/.env.windows <<'EOF'
+          DSH_DESKTOP_APP_ID=com.deepseek.dsh
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://update.example.com
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://login.example.com"]}'
+          DSH_DESKTOP_WINDOWS_COMPRESSION_LEVEL=3
+          EOF
+      - name: Build unsigned installer
+        run: pnpm run package:desktop:win:x64:unsigned
+      - name: Deliver installer on a git branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          src="apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts"
+          ls -la "$src"
+          exe=$(ls "$src"/*.exe | head -1)
+          name=$(basename "$exe")
+          out="$RUNNER_TEMP/delivery"
+          mkdir -p "$out"
+          cp "$exe" "$out/"
+          (cd "$out" \
+            && sha256sum "$name" > SHA256SUMS \
+            && split -b 90m -d --additional-suffix=.part "$name" "$name." \
+            && rm "$name")
+          git config user.name "installer-bot"
+          git config user.email "installer-bot@users.noreply.github.com"
+          git checkout --orphan installer-unsigned
+          git rm -rf -q .
+          cp "$out"/* .
+          git add -f SHA256SUMS "$name".*
+          git commit -m "Unsigned Windows installer from run ${GITHUB_RUN_ID}"
+          git push --force origin installer-unsigned
+      - name: Also retain as Actions artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: unsigned-win-installer-${{ github.run_id }}
+          compression-level: 0
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+          retention-days: 7
